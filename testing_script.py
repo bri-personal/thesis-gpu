@@ -25,7 +25,7 @@ def generate_matrix(shape, seed=None) -> np.ndarray:
     return base + noise * mask
 
 
-def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, causal: bool) -> np.ndarray:
+def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, causal: bool, backend: SDPBackend) -> np.ndarray:
     # ensure matching dimensions of 4D tensors
     assert (len(Q_np.shape), len(K_np.shape), len(V_np.shape)) == (4, 4, 4)
     b, h, seq_q, d = Q_np.shape
@@ -41,8 +41,8 @@ def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.nd
     K_torch = torch.from_numpy(K_np).to(device)
     V_torch = torch.from_numpy(V_np).to(device)
 
-    # for Turing arch, cannot use FlashAttention2
-    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+    # Use backend compatible with GPU architecture
+    with sdpa_kernel(backend):
         O_torch = F.scaled_dot_product_attention(Q_torch, K_torch, V_torch,
                                                  attn_mask=None,  # no masking
                                                  dropout_p=0.0,  # no dropout
@@ -58,11 +58,14 @@ def main(seq_q, seq_kv, d, seed, causal):
     K_np = generate_matrix((seq_kv, d), seed=seed).astype(np.float16)[np.newaxis, np.newaxis, :, :]
     V_np = generate_matrix((seq_kv, d), seed=seed).astype(np.float16)[np.newaxis, np.newaxis, :, :]
     
+    # For Turing arch, FA not available. Use MEA instead.
+    backend = SDPBackend.EFFICIENT_ATTENTION
+    
     for _ in range(5):  # warm-up runs
-        scaled_dot_product_attention(Q_np, K_np, V_np, causal)
+        scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
     torch.cuda.synchronize()  # ensure all GPU work is done before timing
     
-    O_np = scaled_dot_product_attention(Q_np, K_np, V_np, causal)
+    O_np = scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
     torch.cuda.synchronize()
     print("Output shape:", O_np.shape)
 
