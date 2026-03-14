@@ -5,7 +5,12 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
+# use CUDA on GPU
+device = torch.device(
+    'cuda' if torch.cuda.is_available() else 'cpu'
+)
 
+# From FSA Paper:
 # following FlashAttention-3 paper
 def generate_matrix(shape, seed=None) -> np.ndarray:
     if seed is not None:
@@ -31,11 +36,6 @@ def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.nd
     assert d == dk, "Q and K head dim must be equal"
     assert d == dv, f"Q ({d}) and V ({dv}) head dim must be equal"
     assert seq_k == seq_v, "K and V must have equal seq len"
-
-    # use CUDA on GPU
-    device = torch.device(
-        'cuda' if torch.cuda.is_available() else 'cpu'
-    )
 
     Q_torch = torch.from_numpy(Q_np).to(device)
     K_torch = torch.from_numpy(K_np).to(device)
