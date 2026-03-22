@@ -1,6 +1,7 @@
 import argparse
-import numpy as np
+from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -9,6 +10,7 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 device = torch.device(
     'cuda' if torch.cuda.is_available() else 'cpu'
 )
+
 
 # From FSA Paper:
 # following FlashAttention-3 paper
@@ -25,7 +27,8 @@ def generate_matrix(shape, seed=None) -> np.ndarray:
     return base + noise * mask
 
 
-def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, causal: bool, backend: SDPBackend) -> np.ndarray:
+def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, causal: bool,
+                                 backend: SDPBackend) -> np.ndarray:
     # ensure matching dimensions of 4D tensors
     assert (len(Q_np.shape), len(K_np.shape), len(V_np.shape)) == (4, 4, 4)
     b, h, seq_q, d = Q_np.shape
@@ -51,20 +54,33 @@ def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.nd
     return O_torch.cpu().numpy()
 
 
-def main(seq_q: int, seq_kv: int, d: int, seed: int, causal: bool, warmup: int):
+def main(seq_q: int, seq_kv: int, d: int, seed: int, causal: bool, warmup: int, kernel: str):
     # Use FP16 for FA1 or MemEff Attention
     # Ensure 4D with correct axes to match MemEff implementation
     Q_np = generate_matrix((seq_q, d), seed=seed).astype(np.float16)[np.newaxis, np.newaxis, :, :]
     K_np = generate_matrix((seq_kv, d), seed=seed).astype(np.float16)[np.newaxis, np.newaxis, :, :]
     V_np = generate_matrix((seq_kv, d), seed=seed).astype(np.float16)[np.newaxis, np.newaxis, :, :]
-    
-    # For Turing arch, FA not available. Use MEA instead.
-    backend = SDPBackend.EFFICIENT_ATTENTION
-    
+
+    backend: Optional[SDPBackend] = None
+    match kernel.lower():
+        case "flash":
+            backend = SDPBackend.FLASH_ATTENTION
+        case "mea":
+            # For Turing arch, FA not available. Use MEA instead.
+            backend = SDPBackend.EFFICIENT_ATTENTION
+        case "cudnn":
+            backend = SDPBackend.CUDNN_ATTENTION
+        case "math":
+            # Non-memory aware implementation, slowest
+            backend = SDPBackend.MATH
+
+    if backend is None:
+        raise ValueError(f"Unrecognized attention kernel: {kernel}")
+
     for _ in range(warmup):  # warm-up runs
         scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
     torch.cuda.synchronize()  # ensure all GPU work is done before timing
-    
+
     O_np = scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
     torch.cuda.synchronize()
     print("Output shape:", O_np.shape)
@@ -78,6 +94,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--causal", action="store_true", default=False)
     parser.add_argument("--warmup", type=int, default=10, help="Number of warm-up runs before timing")
+    parser.add_argument("--kernel", type=str, required=True, help="Must be one of ('flash', 'mea', 'cudnn', 'math')")
     args = parser.parse_args()
 
-    main(args.seq_q, args.seq_kv, args.d, args.seed, args.causal, args.warmup)
+    main(args.seq_q, args.seq_kv, args.d, args.seed, args.causal, args.warmup, args.kernel)
