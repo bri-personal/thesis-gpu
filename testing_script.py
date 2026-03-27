@@ -2,7 +2,9 @@ import argparse
 from typing import Optional
 
 import numpy as np
+import nvtx
 import torch
+import torch.cuda.profiler as profiler
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
@@ -54,7 +56,7 @@ def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.nd
     return O_torch.cpu().numpy()
 
 
-def main(seq_q: int, seq_kv: int, d: int, seed: int, causal: bool, warmup: int, kernel: str):
+def main(seq_q: int, seq_kv: int, d: int, seed: int, causal: bool, warmup: int, kernel: str, iterations: int):
     # Use FP16 for FA1 or MemEff Attention
     # Ensure 4D with correct axes to match MemEff implementation
     Q_np = generate_matrix((seq_q, d), seed=seed).astype(np.float16)[np.newaxis, np.newaxis, :, :]
@@ -81,8 +83,13 @@ def main(seq_q: int, seq_kv: int, d: int, seed: int, causal: bool, warmup: int, 
         scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
     torch.cuda.synchronize()  # ensure all GPU work is done before timing
 
-    O_np = scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
-    torch.cuda.synchronize()
+    # Only profile this region
+    profiler.start()
+    with nvtx.annotate("timed_region"):
+        for _ in range(iterations):
+            O_np = scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
+        torch.cuda.synchronize()
+    profiler.stop()
     print("Output shape:", O_np.shape)
 
 
@@ -94,7 +101,10 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--causal", action="store_true", default=False)
     parser.add_argument("--warmup", type=int, default=10, help="Number of warm-up runs before timing")
-    parser.add_argument("--kernel", type=str, required=True, help="Must be one of ('flash', 'mea', 'cudnn', 'math')")
+    parser.add_argument("--kernel", type=str, required=True,
+                        help="Must be one of ('flash', 'mea', 'cudnn', 'math')")
+    parser.add_argument("--iterations", type=int, default=1,
+                        help="Number of iterations. Default 1 for NCU, set higher for NSys")
     args = parser.parse_args()
 
-    main(args.seq_q, args.seq_kv, args.d, args.seed, args.causal, args.warmup, args.kernel)
+    main(args.seq_q, args.seq_kv, args.d, args.seed, args.causal, args.warmup, args.kernel, args.iterations)
