@@ -1,12 +1,9 @@
 import argparse
-from typing import Optional
 
 import numpy as np
 import nvtx
 import torch
 import torch.cuda.profiler as profiler
-import torch.nn.functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend
 
 # use CUDA on GPU
 device = torch.device(
@@ -29,8 +26,60 @@ def generate_matrix(shape, seed=None) -> np.ndarray:
     return base + noise * mask
 
 
-def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, causal: bool,
-                                 backend: SDPBackend) -> np.ndarray:
+def sdpa_fa3_4(kernel: str, Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, causal: bool) -> np.ndarray:
+    try:
+        if kernel == "flash3":
+            from flash_attn_interface import flash_attn_func
+        elif kernel == "flash4":
+            from flash_attn.cute import flash_attn_func
+        else:
+            raise ValueError(f"Unrecognized attention kernel: {kernel}")
+    except ImportError as e:
+        raise e
+
+    # FA3/4 expect (batch, seqlen, nheads, headdim) — transpose from (b, h, s, d)
+    Q_torch = torch.from_numpy(Q_np).to(device).permute(0, 2, 1, 3)
+    K_torch = torch.from_numpy(K_np).to(device).permute(0, 2, 1, 3)
+    V_torch = torch.from_numpy(V_np).to(device).permute(0, 2, 1, 3)
+
+    O_torch, _ = flash_attn_func(Q_torch, K_torch, V_torch, causal=causal)
+    return O_torch.permute(0, 2, 1, 3).cpu().numpy()
+
+
+def sdpa_torch(kernel: str, Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, causal: bool) -> np.ndarray:
+    import torch.nn.functional as F
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+
+    # Use backend compatible with GPU architecture
+    match kernel:
+        case "flash":
+            backend = SDPBackend.FLASH_ATTENTION
+        case "mea":
+            # For Turing arch, FA not available. Use MEA instead.
+            backend = SDPBackend.EFFICIENT_ATTENTION
+        case "cudnn":
+            backend = SDPBackend.CUDNN_ATTENTION
+        case "math":
+            # Non-memory aware implementation, slowest
+            backend = SDPBackend.MATH
+        case _:
+            raise ValueError(f"Unrecognized attention kernel: {kernel}")
+
+    Q_torch = torch.from_numpy(Q_np).to(device)
+    K_torch = torch.from_numpy(K_np).to(device)
+    V_torch = torch.from_numpy(V_np).to(device)
+
+    with sdpa_kernel(backend):
+        O_torch = F.scaled_dot_product_attention(Q_torch, K_torch, V_torch,
+                                                 attn_mask=None,  # no masking
+                                                 dropout_p=0.0,  # no dropout
+                                                 is_causal=causal)
+
+    return O_torch.cpu().numpy()
+
+
+def scaled_dot_product_attention(kernel: str, Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray,
+                                 causal: bool = False) -> np.ndarray:
     # ensure matching dimensions of 4D tensors
     assert (len(Q_np.shape), len(K_np.shape), len(V_np.shape)) == (4, 4, 4)
     b, h, seq_q, d = Q_np.shape
@@ -42,18 +91,12 @@ def scaled_dot_product_attention(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.nd
     assert d == dv, f"Q ({d}) and V ({dv}) head dim must be equal"
     assert seq_k == seq_v, "K and V must have equal seq len"
 
-    Q_torch = torch.from_numpy(Q_np).to(device)
-    K_torch = torch.from_numpy(K_np).to(device)
-    V_torch = torch.from_numpy(V_np).to(device)
+    # FlashAttention-3 and -4
+    if kernel == "flash3" or kernel == "flash4":
+        return sdpa_fa3_4(kernel, Q_np, K_np, V_np, causal)
 
-    # Use backend compatible with GPU architecture
-    with sdpa_kernel(backend):
-        O_torch = F.scaled_dot_product_attention(Q_torch, K_torch, V_torch,
-                                                 attn_mask=None,  # no masking
-                                                 dropout_p=0.0,  # no dropout
-                                                 is_causal=causal)
-
-    return O_torch.cpu().numpy()
+    # Pytorch Native (Math, MEA, FlashAttention-2, CuDNN)
+    return sdpa_torch(kernel, Q_np, K_np, V_np, causal)
 
 
 def main(seq_q: int, seq_kv: int, d: int, seed: int, causal: bool, warmup: int, kernel: str, iterations: int):
@@ -63,31 +106,17 @@ def main(seq_q: int, seq_kv: int, d: int, seed: int, causal: bool, warmup: int, 
     K_np = generate_matrix((seq_kv, d), seed=seed).astype(np.float16)[np.newaxis, np.newaxis, :, :]
     V_np = generate_matrix((seq_kv, d), seed=seed).astype(np.float16)[np.newaxis, np.newaxis, :, :]
 
-    backend: Optional[SDPBackend] = None
-    match kernel.lower():
-        case "flash":
-            backend = SDPBackend.FLASH_ATTENTION
-        case "mea":
-            # For Turing arch, FA not available. Use MEA instead.
-            backend = SDPBackend.EFFICIENT_ATTENTION
-        case "cudnn":
-            backend = SDPBackend.CUDNN_ATTENTION
-        case "math":
-            # Non-memory aware implementation, slowest
-            backend = SDPBackend.MATH
-
-    if backend is None:
-        raise ValueError(f"Unrecognized attention kernel: {kernel}")
+    kernel = kernel.lower()
 
     for _ in range(warmup):  # warm-up runs
-        scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
+        scaled_dot_product_attention(kernel, Q_np, K_np, V_np, causal)
     torch.cuda.synchronize()  # ensure all GPU work is done before timing
 
     # Only profile this region
     profiler.start()
     with nvtx.annotate("timed_region"):
         for _ in range(iterations):
-            O_np = scaled_dot_product_attention(Q_np, K_np, V_np, causal, backend)
+            O_np = scaled_dot_product_attention(kernel, Q_np, K_np, V_np, causal)
         torch.cuda.synchronize()
     profiler.stop()
     print("Output shape:", O_np.shape)
@@ -102,7 +131,7 @@ if __name__ == "__main__":
     parser.add_argument("--causal", action="store_true", default=False)
     parser.add_argument("--warmup", type=int, default=10, help="Number of warm-up runs before timing")
     parser.add_argument("--kernel", type=str, required=True,
-                        help="Must be one of ('flash', 'mea', 'cudnn', 'math')")
+                        help="Must be one of ('flash', 'mea', 'cudnn', 'math', 'flash3', 'flash4')")
     parser.add_argument("--iterations", type=int, default=1,
                         help="Number of iterations. Default 1 for NCU, set higher for NSys")
     args = parser.parse_args()
