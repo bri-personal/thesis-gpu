@@ -42,7 +42,7 @@ def sdpa_fa3_4(kernel: str, Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray
     K_torch = torch.from_numpy(K_np).to(device).permute(0, 2, 1, 3)
     V_torch = torch.from_numpy(V_np).to(device).permute(0, 2, 1, 3)
 
-    O_torch, _ = flash_attn_func(Q_torch, K_torch, V_torch, causal=causal)
+    O_torch = flash_attn_func(Q_torch, K_torch, V_torch, causal=causal)
     return O_torch.permute(0, 2, 1, 3).cpu().numpy()
 
 
